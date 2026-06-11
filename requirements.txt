@@ -1,0 +1,4 @@
+alpaca-py
+python-telegram-bot
+pandas
+requests
