@@ -20,7 +20,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
-STATE_FILE = "black_bison_v2_state.json"
+STATE_FILE = "black_bison_stock_v3_state.json"
 
 SYMBOLS = [
     "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "META", "PLTR", "SOFI", "COIN", "MSTR",
@@ -32,7 +32,8 @@ SYMBOLS = [
     "WMT", "COST", "TGT",
     "DIS", "NKE", "ABNB", "PYPL", "SQ",
     "ORCL", "NOW", "MDB", "ZS", "AI", "BABA", "PDD", "LI", "RIVN", "LCID",
-    "F", "GM", "BA", "CAT", "DE", "LULU", "ELF", "CELH", "ROKU", "DKNG"
+    "F", "GM", "BA", "CAT", "DE", "LULU", "ELF", "CELH", "ROKU", "DKNG",
+    "SPCX", "RKLB", "ASTS", "LUNR", "PL", "SPIR", "IRDM"
 ]
 
 STOCK_POSITION_SIZE_DOLLARS = 5000
@@ -44,8 +45,10 @@ OPTION_TAKE_PROFIT_PERCENT = 30.0
 OPTION_STOP_LOSS_PERCENT = 20.0
 
 SCAN_SECONDS = 300
+
 MIN_SCORE_FOR_STOCK = 7
 MIN_SCORE_FOR_OPTION = 8
+
 
 trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
@@ -90,8 +93,10 @@ def get_account_value():
 
 def init_start_equity():
     state = load_state()
+
     if state["start_equity"] is None:
         equity = get_account_value()
+
         if equity is not None:
             state["start_equity"] = equity
             save_state(state)
@@ -196,12 +201,12 @@ def breakout_signal(df):
     last_close = float(df["close"].iloc[-1])
     prev_high = float(df["high"].iloc[-21:-1].max())
     prev_low = float(df["low"].iloc[-21:-1].min())
-    vol_ratio = volume_ratio(df)
+    vol = volume_ratio(df)
 
-    if last_close > prev_high and vol_ratio >= 1.3:
+    if last_close > prev_high and vol >= 1.3:
         return "LONG"
 
-    if last_close < prev_low and vol_ratio >= 1.3:
+    if last_close < prev_low and vol >= 1.3:
         return "SHORT"
 
     return None
@@ -235,9 +240,10 @@ def analyze_symbol(symbol, market_status):
         minute = get_bars(symbol, TimeFrame.Minute, 5)
 
         if daily is None or hourly is None or minute is None:
+            print(f"{symbol}: not enough data", flush=True)
             return None
 
-        h4 = resample_bars(hourly, "4H")
+        h4 = resample_bars(hourly, "4h")
         h1 = hourly
         m15 = resample_bars(minute, "15min")
         m5 = resample_bars(minute, "5min")
@@ -323,10 +329,10 @@ def analyze_symbol(symbol, market_status):
             }
 
         print(
-            f"{symbol}: no V2 setup | market={market_status} "
-            f"D={d_trend} 4H={h4_trend} 1H={h1_trend} "
+            f"{symbol}: no setup | market={market_status} "
+            f"24H={d_trend} 4H={h4_trend} 1H={h1_trend} "
             f"15M={setup_15m} 5M={entry_5m} "
-            f"Lscore={long_score} Sscore={short_score}",
+            f"L={long_score} S={short_score}",
             flush=True
         )
 
@@ -357,6 +363,7 @@ def place_stock_trade(signal):
         return
 
     open_symbols = get_open_symbols()
+
     if symbol in open_symbols:
         return
 
@@ -405,7 +412,7 @@ def place_stock_trade(signal):
 
     save_state(state)
 
-    msg = f"""🐃 BLACK BISON TRADER V2 — STOCK
+    msg = f"""🐃 BLACK BISON STOCK V3
 
 📈 {symbol} LONG
 
@@ -478,6 +485,7 @@ def get_option_contract(symbol, side, stock_price):
                 if best is None or distance < best_distance:
                     best = c
                     best_distance = distance
+
             except Exception:
                 continue
 
@@ -543,7 +551,7 @@ def place_option_trade(signal):
 
     option_type = "CALL" if signal["side"] == "LONG" else "PUT"
 
-    msg = f"""🐃 BLACK BISON TRADER V2 — OPTION
+    msg = f"""🐃 BLACK BISON OPTION V3
 
 🎯 {symbol} {option_type}
 
@@ -635,7 +643,11 @@ def monitor_options():
             trade["pnl_dollars"] = pnl_dollars
 
             for item in state["learning_log"]:
-                if item.get("type") == "OPTION" and item.get("option_symbol") == option_symbol and item.get("result") == "OPEN":
+                if (
+                    item.get("type") == "OPTION" and
+                    item.get("option_symbol") == option_symbol and
+                    item.get("result") == "OPEN"
+                ):
                     item["result"] = result
                     item["pnl_percent"] = pnl_percent
                     item["pnl_dollars"] = pnl_dollars
@@ -704,10 +716,11 @@ def get_stats_text():
     option_pnl = sum(float(t.get("pnl_dollars", 0)) for t in closed_options)
 
     total_pnl_text = "N/A"
+
     if equity is not None and start_equity is not None:
         total_pnl_text = f"${equity - float(start_equity):.2f}"
 
-    return f"""📊 BLACK BISON TRADER V2 STATS
+    return f"""📊 BLACK BISON STOCK V3 STATS
 
 Account Equity: ${equity:.2f}
 Start Equity: ${float(start_equity):.2f}
@@ -737,7 +750,7 @@ def get_open_text():
 
     lines = ["📌 OPEN POSITIONS\n"]
 
-    for p in positions[:60]:
+    for p in positions[:80]:
         try:
             lines.append(
                 f"{p.symbol}: Qty {p.qty}, P/L ${float(p.unrealized_pl):.2f}, "
@@ -762,23 +775,27 @@ def get_learn_text():
 
     for x in closed:
         score = str(x.get("score", "NA"))
-        by_score.setdefault(score, {"wins": 0, "losses": 0, "count": 0})
+        by_score.setdefault(score, {"wins": 0, "losses": 0, "count": 0, "net": 0})
 
         by_score[score]["count"] += 1
+
+        pnl = float(x.get("pnl_dollars", 0))
+        by_score[score]["net"] += pnl
 
         if x.get("result") == "TP":
             by_score[score]["wins"] += 1
         elif x.get("result") == "SL":
             by_score[score]["losses"] += 1
 
-    lines = ["🧠 BLACK BISON LEARNING V2\n"]
+    lines = ["🧠 BLACK BISON STOCK V3 LEARNING\n"]
 
     for score, data in sorted(by_score.items()):
         total = data["wins"] + data["losses"]
         win_rate = (data["wins"] / total) * 100 if total > 0 else 0
         lines.append(
             f"Score {score}: {data['count']} closed | "
-            f"W {data['wins']} / L {data['losses']} | WR {win_rate:.1f}%"
+            f"W {data['wins']} / L {data['losses']} | "
+            f"WR {win_rate:.1f}% | Net ${data['net']:.2f}"
         )
 
     return "\n".join(lines)
@@ -811,7 +828,7 @@ def handle_telegram_commands():
                 continue
 
             if text == "/start":
-                send_telegram("🐃 Black Bison Trader V2 is online.")
+                send_telegram("🐃 Black Bison Stock V3 is online.")
 
             elif text == "/stats":
                 send_telegram(get_stats_text())
@@ -834,8 +851,8 @@ def handle_telegram_commands():
 def main():
     init_start_equity()
 
-    print("BLACK BISON TRADER V2 LIVE", flush=True)
-    send_telegram("🐃 Black Bison Trader V2 started. Multi-timeframe mode ON.")
+    print("BLACK BISON STOCK V3 LIVE", flush=True)
+    send_telegram("🐃 Black Bison Stock V3 started. 4h bug fixed. Space sector added.")
 
     last_scan = 0
 
@@ -843,7 +860,7 @@ def main():
         handle_telegram_commands()
 
         if time.time() - last_scan >= SCAN_SECONDS:
-            print("Scanning Black Bison Trader V2...", flush=True)
+            print("Scanning Black Bison Stock V3...", flush=True)
             scan()
             last_scan = time.time()
 
