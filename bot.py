@@ -20,7 +20,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
-STATE_FILE = "black_bison_stock_v3_state.json"
+STATE_FILE = "black_bison_stock_v32_state.json"
 
 SYMBOLS = [
     "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "META", "PLTR", "SOFI", "COIN", "MSTR",
@@ -46,9 +46,8 @@ OPTION_STOP_LOSS_PERCENT = 20.0
 
 SCAN_SECONDS = 300
 
-MIN_SCORE_FOR_STOCK = 7
-MIN_SCORE_FOR_OPTION = 8
-
+MIN_SCORE_FOR_STOCK = 8
+MIN_SCORE_FOR_OPTION = 9
 
 trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
@@ -66,7 +65,6 @@ def load_state():
     state.setdefault("learning_log", [])
     state.setdefault("telegram_offset", None)
     state.setdefault("start_equity", None)
-
     return state
 
 
@@ -93,10 +91,8 @@ def get_account_value():
 
 def init_start_equity():
     state = load_state()
-
     if state["start_equity"] is None:
         equity = get_account_value()
-
         if equity is not None:
             state["start_equity"] = equity
             save_state(state)
@@ -111,8 +107,7 @@ def get_positions():
 
 
 def get_open_symbols():
-    positions = get_positions()
-    return {p.symbol for p in positions}
+    return {p.symbol for p in get_positions()}
 
 
 def get_bars(symbol, timeframe, days):
@@ -137,12 +132,100 @@ def get_bars(symbol, timeframe, days):
 
     df = df.copy()
     df.index = pd.to_datetime(df.index)
-
     return df
 
 
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
+
+
+def smma(series, period):
+    return series.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def rsi(series, period=14):
+    if series is None or len(series) < period + 2:
+        return None
+
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+
+    rs = avg_gain / avg_loss
+    out = 100 - (100 / (1 + rs))
+    return out
+
+
+def stoch_rsi_value(series, rsi_period=14, stoch_period=14):
+    r = rsi(series, rsi_period)
+    if r is None or len(r.dropna()) < stoch_period:
+        return None
+
+    min_rsi = r.rolling(stoch_period).min()
+    max_rsi = r.rolling(stoch_period).max()
+    stoch = 100 * (r - min_rsi) / (max_rsi - min_rsi)
+    val = stoch.iloc[-1]
+
+    if pd.isna(val):
+        return None
+
+    return float(val)
+
+
+def alligator_signal(df):
+    if df is None or len(df) < 60:
+        return "UNKNOWN"
+
+    median_price = (df["high"] + df["low"]) / 2
+
+    jaw = smma(median_price, 13).iloc[-1]
+    teeth = smma(median_price, 8).iloc[-1]
+    lips = smma(median_price, 5).iloc[-1]
+
+    if pd.isna(jaw) or pd.isna(teeth) or pd.isna(lips):
+        return "UNKNOWN"
+
+    if lips > teeth > jaw:
+        return "BULLISH"
+
+    if lips < teeth < jaw:
+        return "BEARISH"
+
+    return "SLEEPING"
+
+
+def fibonacci_zone(df, side):
+    if df is None or len(df) < 50:
+        return "UNKNOWN"
+
+    lookback = df.iloc[-50:]
+    swing_high = float(lookback["high"].max())
+    swing_low = float(lookback["low"].min())
+    price = float(df["close"].iloc[-1])
+
+    if swing_high <= swing_low:
+        return "UNKNOWN"
+
+    rng = swing_high - swing_low
+
+    fib_382 = swing_high - rng * 0.382
+    fib_500 = swing_high - rng * 0.500
+    fib_618 = swing_high - rng * 0.618
+
+    if side == "LONG":
+        if fib_618 <= price <= fib_382:
+            return "LONG_ZONE"
+
+    if side == "SHORT":
+        short_382 = swing_low + rng * 0.382
+        short_618 = swing_low + rng * 0.618
+        if short_382 <= price <= short_618:
+            return "SHORT_ZONE"
+
+    return "NO_ZONE"
 
 
 def resample_bars(df, rule):
@@ -259,6 +342,10 @@ def analyze_symbol(symbol, market_status):
         vol_5m = volume_ratio(m5) if m5 is not None else 0
         vol_15m = volume_ratio(m15) if m15 is not None else 0
 
+        stoch_15m = stoch_rsi_value(m15["close"]) if m15 is not None else None
+        alligator_1h = alligator_signal(h1)
+        alligator_15m = alligator_signal(m15)
+
         long_score = 0
         short_score = 0
 
@@ -296,42 +383,64 @@ def analyze_symbol(symbol, market_status):
             long_score += 1
             short_score += 1
 
+        if stoch_15m is not None:
+            if 20 <= stoch_15m <= 80:
+                long_score += 1
+                short_score += 1
+            if stoch_15m < 20 and d_trend == "UP":
+                long_score += 1
+            if stoch_15m > 80 and d_trend == "DOWN":
+                short_score += 1
+
+        if alligator_1h == "BULLISH" or alligator_15m == "BULLISH":
+            long_score += 1
+
+        if alligator_1h == "BEARISH" or alligator_15m == "BEARISH":
+            short_score += 1
+
+        fib_long = fibonacci_zone(h1, "LONG")
+        fib_short = fibonacci_zone(h1, "SHORT")
+
+        if fib_long == "LONG_ZONE":
+            long_score += 1
+
+        if fib_short == "SHORT_ZONE":
+            short_score += 1
+
+        base_features = {
+            "symbol": symbol,
+            "price": last_price,
+            "market": market_status,
+            "daily": d_trend,
+            "h4": h4_trend,
+            "h1": h1_trend,
+            "m15": setup_15m,
+            "m5": entry_5m,
+            "vol5": vol_5m,
+            "vol15": vol_15m,
+            "stoch_rsi_15m": stoch_15m,
+            "alligator_1h": alligator_1h,
+            "alligator_15m": alligator_15m,
+            "fib_long": fib_long,
+            "fib_short": fib_short,
+        }
+
         if long_score >= MIN_SCORE_FOR_STOCK and long_score > short_score:
-            return {
-                "symbol": symbol,
-                "side": "LONG",
-                "price": last_price,
-                "score": long_score,
-                "market": market_status,
-                "daily": d_trend,
-                "h4": h4_trend,
-                "h1": h1_trend,
-                "m15": setup_15m,
-                "m5": entry_5m,
-                "vol5": vol_5m,
-                "vol15": vol_15m
-            }
+            signal = dict(base_features)
+            signal.update({"side": "LONG", "score": long_score})
+            return signal
 
         if short_score >= MIN_SCORE_FOR_OPTION and short_score > long_score:
-            return {
-                "symbol": symbol,
-                "side": "SHORT",
-                "price": last_price,
-                "score": short_score,
-                "market": market_status,
-                "daily": d_trend,
-                "h4": h4_trend,
-                "h1": h1_trend,
-                "m15": setup_15m,
-                "m5": entry_5m,
-                "vol5": vol_5m,
-                "vol15": vol_15m
-            }
+            signal = dict(base_features)
+            signal.update({"side": "SHORT", "score": short_score})
+            return signal
 
         print(
             f"{symbol}: no setup | market={market_status} "
             f"24H={d_trend} 4H={h4_trend} 1H={h1_trend} "
             f"15M={setup_15m} 5M={entry_5m} "
+            f"Stoch={stoch_15m} Alligator1H={alligator_1h} "
+            f"FibL={fib_long} FibS={fib_short} "
             f"L={long_score} S={short_score}",
             flush=True
         )
@@ -362,9 +471,7 @@ def place_stock_trade(signal):
     if stock_trade_already_open(symbol):
         return
 
-    open_symbols = get_open_symbols()
-
-    if symbol in open_symbols:
+    if symbol in get_open_symbols():
         return
 
     price = signal["price"]
@@ -386,7 +493,7 @@ def place_stock_trade(signal):
     submitted = trading_client.submit_order(order_data=order)
 
     state = load_state()
-    state["stock_trades"].append({
+    trade = {
         "symbol": symbol,
         "side": "LONG",
         "qty": qty,
@@ -398,8 +505,9 @@ def place_stock_trade(signal):
         "status": "OPEN",
         "created_at": int(time.time()),
         "order_id": str(submitted.id)
-    })
+    }
 
+    state["stock_trades"].append(trade)
     state["learning_log"].append({
         "type": "STOCK",
         "symbol": symbol,
@@ -407,12 +515,12 @@ def place_stock_trade(signal):
         "score": signal["score"],
         "features": signal,
         "result": "OPEN",
-        "created_at": int(time.time())
+        "created_at": trade["created_at"]
     })
 
     save_state(state)
 
-    msg = f"""🐃 BLACK BISON STOCK V3
+    msg = f"""🐃 BLACK BISON STOCK V3.2
 
 📈 {symbol} LONG
 
@@ -422,13 +530,17 @@ Qty: {qty}
 TP: ${tp_price}
 SL: ${sl_price}
 
-Score: {signal['score']}/10
+Score: {signal['score']}/12
 Market: {signal['market']}
 24H: {signal['daily']}
 4H: {signal['h4']}
 1H: {signal['h1']}
 15M: {signal['m15']}
 5M: {signal['m5']}
+
+Stoch RSI 15M: {signal['stoch_rsi_15m']}
+Alligator 1H: {signal['alligator_1h']}
+Fib: {signal['fib_long']}
 
 Status: PAPER STOCK ORDER SENT"""
 
@@ -449,7 +561,6 @@ def get_option_contract(symbol, side, stock_price):
     exp_lte = today + timedelta(days=21)
 
     contract_type = "call" if side == "LONG" else "put"
-
     url = "https://paper-api.alpaca.markets/v2/options/contracts"
 
     params = {
@@ -485,7 +596,6 @@ def get_option_contract(symbol, side, stock_price):
                 if best is None or distance < best_distance:
                     best = c
                     best_distance = distance
-
             except Exception:
                 continue
 
@@ -524,7 +634,7 @@ def place_option_trade(signal):
     submitted = trading_client.submit_order(order_data=order)
 
     state = load_state()
-    state["option_trades"].append({
+    trade = {
         "underlying": symbol,
         "option_symbol": option_symbol,
         "side": signal["side"],
@@ -534,8 +644,9 @@ def place_option_trade(signal):
         "status": "OPEN",
         "created_at": int(time.time()),
         "order_id": str(submitted.id)
-    })
+    }
 
+    state["option_trades"].append(trade)
     state["learning_log"].append({
         "type": "OPTION",
         "symbol": symbol,
@@ -544,27 +655,31 @@ def place_option_trade(signal):
         "score": signal["score"],
         "features": signal,
         "result": "OPEN",
-        "created_at": int(time.time())
+        "created_at": trade["created_at"]
     })
 
     save_state(state)
 
     option_type = "CALL" if signal["side"] == "LONG" else "PUT"
 
-    msg = f"""🐃 BLACK BISON OPTION V3
+    msg = f"""🐃 BLACK BISON OPTION V3.2
 
 🎯 {symbol} {option_type}
 
 Option: {option_symbol}
 Qty: {OPTION_QTY}
 
-Score: {signal['score']}/10
+Score: {signal['score']}/12
 Market: {signal['market']}
 24H: {signal['daily']}
 4H: {signal['h4']}
 1H: {signal['h1']}
 15M: {signal['m15']}
 5M: {signal['m5']}
+
+Stoch RSI 15M: {signal['stoch_rsi_15m']}
+Alligator 1H: {signal['alligator_1h']}
+Fib: {signal['fib_short'] if signal['side'] == 'SHORT' else signal['fib_long']}
 
 TP: +{OPTION_TAKE_PROFIT_PERCENT:.0f}%
 SL: -{OPTION_STOP_LOSS_PERCENT:.0f}%
@@ -573,6 +688,16 @@ Status: PAPER OPTION ORDER SENT"""
 
     print(msg, flush=True)
     send_telegram(msg)
+
+
+def get_latest_price(symbol):
+    try:
+        df = get_bars(symbol, TimeFrame.Minute, 1)
+        if df is None or df.empty:
+            return None
+        return float(df["close"].iloc[-1])
+    except Exception:
+        return None
 
 
 def monitor_stock_trades():
@@ -589,13 +714,51 @@ def monitor_stock_trades():
         if symbol in open_symbols:
             continue
 
-        trade["status"] = "CLOSED"
+        exit_price = get_latest_price(symbol)
+        entry = float(trade.get("entry_approx", 0))
+        qty = int(trade.get("qty", 0))
+
+        if exit_price is None or entry <= 0 or qty <= 0:
+            trade["status"] = "CLOSED_UNKNOWN"
+            trade["closed_at"] = int(time.time())
+            changed = True
+            continue
+
+        pnl_dollars = (exit_price - entry) * qty
+        pnl_percent = ((exit_price - entry) / entry) * 100
+
+        result = "TP" if pnl_dollars > 0 else "SL"
+
+        trade["status"] = result
         trade["closed_at"] = int(time.time())
-        trade["note"] = "Closed by Alpaca bracket or manual close. Exact P/L in Alpaca."
+        trade["exit_approx"] = exit_price
+        trade["pnl_dollars"] = pnl_dollars
+        trade["pnl_percent"] = pnl_percent
+
+        for item in state["learning_log"]:
+            if (
+                item.get("type") == "STOCK"
+                and item.get("symbol") == symbol
+                and item.get("created_at") == trade.get("created_at")
+                and item.get("result") == "OPEN"
+            ):
+                item["result"] = result
+                item["pnl_dollars"] = pnl_dollars
+                item["pnl_percent"] = pnl_percent
+                item["closed_at"] = int(time.time())
 
         changed = True
 
-        send_telegram(f"🐃 STOCK CLOSED\n{symbol}\nCheck Alpaca Activities for exact fill.")
+        emoji = "✅" if result == "TP" else "❌"
+
+        send_telegram(
+            f"🐃 STOCK RESULT V3.2\n\n"
+            f"{emoji} {symbol}\n"
+            f"Entry approx: ${entry:.2f}\n"
+            f"Exit approx: ${exit_price:.2f}\n"
+            f"P/L: ${pnl_dollars:.2f}\n"
+            f"P/L %: {pnl_percent:.2f}%"
+        )
 
     if changed:
         save_state(state)
@@ -614,7 +777,7 @@ def monitor_options():
         option_symbol = trade["option_symbol"]
 
         if option_symbol not in position_map:
-            trade["status"] = "CLOSED"
+            trade["status"] = "CLOSED_UNKNOWN"
             trade["closed_at"] = int(time.time())
             changed = True
             continue
@@ -644,21 +807,22 @@ def monitor_options():
 
             for item in state["learning_log"]:
                 if (
-                    item.get("type") == "OPTION" and
-                    item.get("option_symbol") == option_symbol and
-                    item.get("result") == "OPEN"
+                    item.get("type") == "OPTION"
+                    and item.get("option_symbol") == option_symbol
+                    and item.get("result") == "OPEN"
                 ):
                     item["result"] = result
                     item["pnl_percent"] = pnl_percent
                     item["pnl_dollars"] = pnl_dollars
+                    item["closed_at"] = int(time.time())
 
             changed = True
-
             emoji = "✅" if result == "TP" else "❌"
 
             send_telegram(
-                f"🐃 OPTION RESULT\n\n{emoji} {trade['underlying']}\n"
-                f"{option_symbol}\nResult: {result}\nP/L: {pnl_percent:.2f}%\n${pnl_dollars:.2f}"
+                f"🐃 OPTION RESULT V3.2\n\n{emoji} {trade['underlying']}\n"
+                f"{option_symbol}\nResult: {result}\n"
+                f"P/L: {pnl_percent:.2f}%\n${pnl_dollars:.2f}"
             )
 
         except Exception as e:
@@ -703,24 +867,30 @@ def get_stats_text():
     open_stock = [t for t in stock_trades if t.get("status") == "OPEN"]
     closed_stock = [t for t in stock_trades if t.get("status") != "OPEN"]
 
+    stock_wins = [t for t in closed_stock if t.get("status") == "TP"]
+    stock_losses = [t for t in closed_stock if t.get("status") == "SL"]
+
+    stock_realized = sum(float(t.get("pnl_dollars", 0)) for t in closed_stock)
+    stock_total = len(stock_wins) + len(stock_losses)
+    stock_wr = (len(stock_wins) / stock_total) * 100 if stock_total else 0
+
+    avg_stock_win = sum(float(t.get("pnl_dollars", 0)) for t in stock_wins) / len(stock_wins) if stock_wins else 0
+    avg_stock_loss = sum(float(t.get("pnl_dollars", 0)) for t in stock_losses) / len(stock_losses) if stock_losses else 0
+
     open_options = [t for t in option_trades if t.get("status") == "OPEN"]
     closed_options = [t for t in option_trades if t.get("status") != "OPEN"]
 
     option_wins = [t for t in closed_options if t.get("status") == "TP"]
     option_losses = [t for t in closed_options if t.get("status") == "SL"]
-
-    option_win_rate = 0
-    if len(option_wins) + len(option_losses) > 0:
-        option_win_rate = (len(option_wins) / (len(option_wins) + len(option_losses))) * 100
-
+    option_total = len(option_wins) + len(option_losses)
+    option_win_rate = (len(option_wins) / option_total) * 100 if option_total else 0
     option_pnl = sum(float(t.get("pnl_dollars", 0)) for t in closed_options)
 
     total_pnl_text = "N/A"
-
     if equity is not None and start_equity is not None:
         total_pnl_text = f"${equity - float(start_equity):.2f}"
 
-    return f"""📊 BLACK BISON STOCK V3 STATS
+    return f"""📊 BLACK BISON STOCK V3.2 STATS
 
 Account Equity: ${equity:.2f}
 Start Equity: ${float(start_equity):.2f}
@@ -729,6 +899,12 @@ Total Account P/L: {total_pnl_text}
 📈 Stocks:
 Open: {len(open_stock)}
 Closed: {len(closed_stock)}
+✅ Wins: {len(stock_wins)}
+❌ Losses: {len(stock_losses)}
+🏆 Stock Win Rate: {stock_wr:.2f}%
+💵 Stock Realized P/L: ${stock_realized:.2f}
+🟢 Avg Stock Win: ${avg_stock_win:.2f}
+🔴 Avg Stock Loss: ${avg_stock_loss:.2f}
 
 🎯 Options:
 Open: {len(open_options)}
@@ -764,21 +940,18 @@ def get_open_text():
 
 def get_learn_text():
     state = load_state()
-    logs = state["learning_log"]
+    logs = [x for x in state["learning_log"] if x.get("result") != "OPEN"]
 
-    closed = [x for x in logs if x.get("result") != "OPEN"]
-
-    if not closed:
+    if not logs:
         return "🧠 Learning: not enough closed trades yet."
 
     by_score = {}
 
-    for x in closed:
+    for x in logs:
         score = str(x.get("score", "NA"))
         by_score.setdefault(score, {"wins": 0, "losses": 0, "count": 0, "net": 0})
 
         by_score[score]["count"] += 1
-
         pnl = float(x.get("pnl_dollars", 0))
         by_score[score]["net"] += pnl
 
@@ -787,15 +960,15 @@ def get_learn_text():
         elif x.get("result") == "SL":
             by_score[score]["losses"] += 1
 
-    lines = ["🧠 BLACK BISON STOCK V3 LEARNING\n"]
+    lines = ["🧠 BLACK BISON STOCK V3.2 LEARNING\n"]
 
     for score, data in sorted(by_score.items()):
         total = data["wins"] + data["losses"]
-        win_rate = (data["wins"] / total) * 100 if total > 0 else 0
+        wr = (data["wins"] / total) * 100 if total else 0
         lines.append(
             f"Score {score}: {data['count']} closed | "
             f"W {data['wins']} / L {data['losses']} | "
-            f"WR {win_rate:.1f}% | Net ${data['net']:.2f}"
+            f"WR {wr:.1f}% | Net ${data['net']:.2f}"
         )
 
     return "\n".join(lines)
@@ -828,7 +1001,7 @@ def handle_telegram_commands():
                 continue
 
             if text == "/start":
-                send_telegram("🐃 Black Bison Stock V3 is online.")
+                send_telegram("🐃 Black Bison Stock V3.2 is online.")
 
             elif text == "/stats":
                 send_telegram(get_stats_text())
@@ -851,8 +1024,8 @@ def handle_telegram_commands():
 def main():
     init_start_equity()
 
-    print("BLACK BISON STOCK V3 LIVE", flush=True)
-    send_telegram("🐃 Black Bison Stock V3 started. 4h bug fixed. Space sector added.")
+    print("BLACK BISON STOCK V3.2 LIVE", flush=True)
+    send_telegram("🐃 Black Bison Stock V3.2 started. Stats fixed + Stoch RSI + Alligator + Fibonacci added.")
 
     last_scan = 0
 
@@ -860,7 +1033,7 @@ def main():
         handle_telegram_commands()
 
         if time.time() - last_scan >= SCAN_SECONDS:
-            print("Scanning Black Bison Stock V3...", flush=True)
+            print("Scanning Black Bison Stock V3.2...", flush=True)
             scan()
             last_scan = time.time()
 
